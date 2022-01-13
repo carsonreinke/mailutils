@@ -4,15 +4,14 @@ import (
 	"log"
     "math"
     "strings"
-    "time"
     //"os"
 
 	"github.com/emersion/go-imap/client"
 	"github.com/emersion/go-imap"
 )
 
+const retries = 3
 const pageSize uint32 = 100
-const timeOut string = "60s"
 
 type Downloader struct {
 	configuration *Configuration
@@ -24,13 +23,16 @@ func NewDownloader(configuration *Configuration) *Downloader {
 }
 
 func (d *Downloader) Download() error {
-	c, err := d.createClient()
-    if c != nil {
-        defer c.Logout()
-    }
+    i, err := Retry(retries, d.configuration.TimeoutDuration, func() (interface{}, error) {
+        return d.createClient()
+    })
     if err != nil {
 		return err
 	}
+    c := i.(*client.Client)
+    if c != nil {
+        defer c.Logout()
+    }
 
 	mailboxes := make(chan *imap.MailboxInfo, 5)
 	done := make(chan error, 1)
@@ -52,7 +54,13 @@ func (d *Downloader) Download() error {
         }
 
         log.Printf("Downloading mailbox %s", mailbox.Name)
-		d.downloadMailbox(c, mailbox)
+		_, err := Retry(retries, d.configuration.TimeoutDuration, func() (interface{}, error) {
+            err := d.downloadMailbox(c, mailbox)
+            return nil, err
+        })
+        if err != nil {
+            return err
+        }
 	}
 	if err := <-done; err != nil {
 		return err
@@ -63,16 +71,11 @@ func (d *Downloader) Download() error {
 
 func (d *Downloader) createClient() (*client.Client, error) {
     // TODO: Support non-TLS
-	c, err := client.DialTLS(d.configuration.Address, nil)
+    c, err := client.DialTLS(d.configuration.Address, nil)
     if err != nil {
 		return nil, err
 	}
     //c.SetDebug(os.Stdout)
-
-    c.Timeout, err = time.ParseDuration(timeOut)
-    if err != nil {
-        return nil, err
-    }
 
 	if err := c.Login(d.configuration.User, d.configuration.Password); err != nil {
 		return c, err
@@ -101,15 +104,13 @@ func (d *Downloader) downloadMailbox(c *client.Client, info *imap.MailboxInfo) e
             to = mailbox.Messages
         }
 
-        err := Retry(5, c.Timeout, func() error {
-            return d.downloadRange(c, from, to)
+        _, err := Retry(retries, d.configuration.TimeoutDuration, func() (interface{}, error) {
+            err := d.downloadRange(c, from, to)
+            return nil, err
         })
         if err != nil {
             return err
         }
-        // if err := d.downloadRange(c, from, to); err != nil {
-        //     return err
-        // }
 
         from = to + 1
     }

@@ -53,5 +53,9 @@ func initConfig() {
 	if err := yaml.Unmarshal(contents, configuration); err != nil {
 		cobra.CheckErr(err)
 	}
+
+	if err := configuration.AssignDefaults(); err != nil {
+		cobra.CheckErr(err)
+	}
 }
 
