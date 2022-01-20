@@ -131,6 +131,11 @@ func (d *Downloader) downloadRange(c *client.Client, from uint32, to uint32) err
 	}()
 	
 	for message := range messages {
+        message, err := NewMessage(message)
+        if err != nil {
+            close(done)
+            return err
+        }
 		if err := d.storage.Save(message); err != nil {
             close(done)
 			return err
