@@ -131,7 +131,7 @@ func (d *Downloader) downloadRange(c *client.Client, from uint32, to uint32) err
 	}()
 	
 	for message := range messages {
-        message, err := NewMessage(message)
+        message, err := NewMessageFromIMAP(message)
         if err != nil {
             close(done)
             return err

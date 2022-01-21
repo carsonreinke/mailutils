@@ -2,8 +2,7 @@ package internal
 
 import (
 	"regexp"
-	"net/mail"
-	"log"
+	"fmt"
 	"bufio"
 )
 
@@ -19,7 +18,7 @@ func NewSearcher(configuration *Configuration) *Searcher {
 func (d *Searcher) Search(keywords []string) error {
 	regexps := make([]*regexp.Regexp, len(keywords))
 	for index, keyword := range keywords {
-		regexp, err := regexp.Compile(regexp.QuoteMeta(keyword))
+		regexp, err := regexp.Compile(keyword)
 		if err != nil {
 			return err
 		}
@@ -27,11 +26,11 @@ func (d *Searcher) Search(keywords []string) error {
 	}
 	
 
-	messages := make(chan *mail.Message, 10)
+	messages := make(chan *Message, 10)
 	done := make(chan error, 1)
 
 	go func() {
-		done <- d.storage.Search(func(message *mail.Message) bool {
+		done <- d.storage.Search(func(message *Message) bool {
 			match := true
 			for _, regexp := range regexps {
 				match = match && regexp.MatchReader(bufio.NewReader(message.Body))
@@ -41,7 +40,7 @@ func (d *Searcher) Search(keywords []string) error {
 	}()
 
 	for message := range messages {
-		log.Printf("%v", message.Header.Get("Message-Id"))
+		fmt.Println(message.Header.Get("Message-Id"))
 	}
 	if err := <-done; err != nil {
 		return err

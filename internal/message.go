@@ -14,12 +14,7 @@ type Message struct {
 	Raw []byte
 }
 
-func NewMessage(inbound *imap.Message) (*Message, error) {
-	buffer := bytes.NewBuffer([]byte{})
-	for _, value := range inbound.Body {
-		io.Copy(buffer, value)
-	}
-	
+func newMessageFromBuffer(buffer *bytes.Buffer) (*Message, error) {
 	outbound := new(Message)
 	outbound.Raw = buffer.Bytes()
 	middle, err := mail.ReadMessage(bytes.NewReader(outbound.Raw))
@@ -29,4 +24,20 @@ func NewMessage(inbound *imap.Message) (*Message, error) {
 	outbound.Message = middle
 
 	return outbound, nil
+}
+
+func NewMessageFromIMAP(inbound *imap.Message) (*Message, error) {
+	buffer := bytes.NewBuffer([]byte{})
+	for _, value := range inbound.Body {
+		io.Copy(buffer, value)
+	}
+	
+	return newMessageFromBuffer(buffer)
+}
+
+func NewMessage(inbound io.Reader) (*Message, error) {
+	buffer := bytes.NewBuffer([]byte{})
+	io.Copy(buffer, inbound)
+	
+	return newMessageFromBuffer(buffer)
 }

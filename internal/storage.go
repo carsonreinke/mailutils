@@ -1,13 +1,8 @@
 package internal
 
-import (
-	"net/mail"
-)
-
 type Storage interface {
 	Save(message *Message) error
-	Search(filter func(*mail.Message) (bool), ch chan<- *mail.Message) error
-	// Load(mailId string) (*imap.Message, error)
+	Search(filter func(*Message) (bool), ch chan<- *Message) error
+	Load(mailId string) (*Message, error)
 	// Exists(mailId string) (*bool, error)
-	// LoadAll(ch chan *imap.Message) error
 }

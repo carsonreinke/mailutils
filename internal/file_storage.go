@@ -7,7 +7,6 @@ import (
 	"log"
 	"errors"
 	"strings"
-	"net/mail"
 	"bytes"
 )
 
@@ -23,7 +22,7 @@ func NewFileStorage(basePath string) (*FileStorage) {
 	return &FileStorage{BasePath: basePath}
 }
 
-func (s *FileStorage) messageFilePath(message *mail.Message) (string, error) {
+func (s *FileStorage) messageFilePath(message *Message) (string, error) {
 	if message.Header == nil || strings.TrimSpace(message.Header.Get("Message-Id")) == "" {
 		return "", errors.New("missing envelope and/or message id")
 	}
@@ -40,17 +39,17 @@ func (s *FileStorage) messageFilePath(message *mail.Message) (string, error) {
 	return filepath.Join(s.BasePath, partition, messageId + ".eml"), nil
 }
 
-func (s *FileStorage) load(filePath string) (*mail.Message, error) {
+func (s *FileStorage) load(filePath string) (*Message, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return nil, err
 	}
 
-	message, err := mail.ReadMessage(file)
+	message, err := NewMessage(file)
 	return message, err
 }
 
-func (s *FileStorage) traverse(name string, current_depth int, ch chan<- *mail.Message) error {
+func (s *FileStorage) traverse(name string, current_depth int, ch chan<- *Message) error {
 	entries, err := os.ReadDir(name)
 	if err != nil {
 		close(ch)
@@ -81,7 +80,7 @@ func (s *FileStorage) traverse(name string, current_depth int, ch chan<- *mail.M
 }
 
 func (s *FileStorage) Save(message *Message) error {
-	filePath, err := s.messageFilePath(message.Message)
+	filePath, err := s.messageFilePath(message)
 	if err != nil {
 		return err
 	}
@@ -105,8 +104,8 @@ func (s *FileStorage) Save(message *Message) error {
 	return nil
 }
 
-func (s *FileStorage) Search(filter func(*mail.Message) (bool), ch chan<- *mail.Message) error {
-	filter_ch := make(chan *mail.Message)
+func (s *FileStorage) Search(filter func(*Message) (bool), ch chan<- *Message) error {
+	filter_ch := make(chan *Message)
 	go func() {
 		for message := range filter_ch {
 			if filter(message) {
@@ -124,15 +123,29 @@ func (s *FileStorage) Search(filter func(*mail.Message) (bool), ch chan<- *mail.
 	return err
 }
 
-// func (s *FileStorage) Load(mailId string) (*imap.Message, error) {
+func (s *FileStorage) Load(mailId string) (*Message, error) {
+	ch := make(chan *Message)
+	done := make(chan error)
+	go func() {
+		err := s.traverse(s.BasePath, 0, ch)
 
-// }
+		if err != nil {
+			done <- err
+		}
+	}()
+	
+	for message := range ch {
+		if(message.Header.Get("Message-Id") == mailId) {
+			//close(ch)
+			return message, nil
+		}
+	}
+	if err := <-done; err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
 
 // func (s *FileStorage) Exists(mailId string) (*bool, error) {
 
 // }
-
-// func (s *FileStorage) LoadAll(ch chan *imap.Message) error {
-
-// }
-
