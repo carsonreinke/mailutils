@@ -4,7 +4,8 @@ import (
 	"log"
     "math"
     "strings"
-    //"os"
+    "os"
+    "fmt"
 
 	"github.com/emersion/go-imap/client"
 	"github.com/emersion/go-imap"
@@ -16,15 +17,16 @@ const pageSize uint32 = 100
 type Downloader struct {
 	configuration *Configuration
 	storage Storage
+    debug bool
 }
 
 func NewDownloader(configuration *Configuration) *Downloader {
-    return &Downloader{configuration: configuration, storage: NewFileStorage(configuration.StoragePath)}
+    return &Downloader{configuration: configuration, storage: NewFileStorage(configuration.StoragePath), debug: false}
 }
 
 func (d *Downloader) Download() error {
     i, err := Retry(retries, d.configuration.TimeoutDuration, func() (interface{}, error) {
-        return d.createClient()
+        return d.createClient(d.debug)
     })
     if err != nil {
 		return err
@@ -34,13 +36,15 @@ func (d *Downloader) Download() error {
         defer c.Logout()
     }
 
-	mailboxes := make(chan *imap.MailboxInfo, 5)
-	done := make(chan error, 1)
-	go func () {
-		done <- c.List("", "%", mailboxes)
-	}()
+    i, err = Retry(retries, d.configuration.TimeoutDuration, func() (interface{}, error) {
+        return d.getMailboxes(c)
+    })
+    if err != nil {
+        return err
+    }
+    mailboxes := i.([]*imap.MailboxInfo)
 
-	for mailbox := range mailboxes {
+    for _, mailbox := range mailboxes {
         ignore := false
         for _, ignoreMailbox := range d.configuration.IgnoreMailboxes {
             if strings.ToUpper(ignoreMailbox) == strings.ToUpper(mailbox.Name) {
@@ -54,7 +58,7 @@ func (d *Downloader) Download() error {
         }
 
         log.Printf("Downloading mailbox %s", mailbox.Name)
-		_, err := Retry(retries, d.configuration.TimeoutDuration, func() (interface{}, error) {
+        _, err := Retry(retries, d.configuration.TimeoutDuration, func() (interface{}, error) {
             err := d.downloadMailbox(c, mailbox)
             return nil, err
         })
@@ -62,20 +66,19 @@ func (d *Downloader) Download() error {
             return err
         }
 	}
-	if err := <-done; err != nil {
-		return err
-	}
 
 	return nil
 }
 
-func (d *Downloader) createClient() (*client.Client, error) {
+func (d *Downloader) createClient(debug bool) (*client.Client, error) {
     // TODO: Support non-TLS
     c, err := client.DialTLS(d.configuration.Address, nil)
     if err != nil {
 		return nil, err
 	}
-    //c.SetDebug(os.Stdout)
+    if debug {
+        c.SetDebug(os.Stdout)
+    }
 
 	if err := c.Login(d.configuration.User, d.configuration.Password); err != nil {
 		return c, err
@@ -85,7 +88,29 @@ func (d *Downloader) createClient() (*client.Client, error) {
 		return c, err
 	}
 
+    if state := c.State(); state != 2 {
+        return nil, fmt.Errorf("Connection is incorrect state of %d", state)
+    }
+
     return c, nil
+}
+
+func (d *Downloader) getMailboxes(c *client.Client) ([]*imap.MailboxInfo, error) {
+	mailboxes := make(chan *imap.MailboxInfo)
+	done := make(chan error, 1)
+	go func () {
+        done <- c.List("", "%", mailboxes)
+	}()
+
+    mailboxesInfo := make([]*imap.MailboxInfo, 0)
+	for mailbox := range mailboxes {
+        mailboxesInfo = append(mailboxesInfo, mailbox)
+    }
+	if err := <-done; err != nil {
+		return nil, err
+	}
+
+    return mailboxesInfo, nil
 }
 
 func (d *Downloader) downloadMailbox(c *client.Client, info *imap.MailboxInfo) error {
@@ -93,6 +118,7 @@ func (d *Downloader) downloadMailbox(c *client.Client, info *imap.MailboxInfo) e
     if err != nil {
         return err
     }
+    log.Printf("There are %d messages to download", mailbox.Messages)
 
     // TODO: remove these crazy amount of casts
     pages := uint32(math.Ceil(float64(mailbox.Messages) / float64(pageSize)))
@@ -133,11 +159,9 @@ func (d *Downloader) downloadRange(c *client.Client, from uint32, to uint32) err
 	for message := range messages {
         message, err := NewMessageFromIMAP(message)
         if err != nil {
-            close(done)
             return err
         }
 		if err := d.storage.Save(message); err != nil {
-            close(done)
 			return err
 		}
 	}

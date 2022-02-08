@@ -22,8 +22,12 @@ func NewFileStorage(basePath string) (*FileStorage) {
 	return &FileStorage{BasePath: basePath}
 }
 
+func hasMessageId(message *Message) bool {
+	return message.Header != nil && strings.TrimSpace(message.Header.Get("Message-Id")) != ""
+}
+
 func (s *FileStorage) messageFilePath(message *Message) (string, error) {
-	if message.Header == nil || strings.TrimSpace(message.Header.Get("Message-Id")) == "" {
+	if !hasMessageId(message) {
 		return "", errors.New("missing envelope and/or message id")
 	}
 
@@ -80,6 +84,15 @@ func (s *FileStorage) traverse(name string, current_depth int, ch chan<- *Messag
 }
 
 func (s *FileStorage) Save(message *Message) error {
+	if !hasMessageId(message) {
+		subject := "(no header)"
+		if message.Header != nil {
+			subject = message.Header.Get("Subject")
+		}
+		log.Printf("Skipping message since it has no Message-Id: %s", subject)
+		return nil
+	}
+
 	filePath, err := s.messageFilePath(message)
 	if err != nil {
 		return err
