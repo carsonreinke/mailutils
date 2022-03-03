@@ -32,7 +32,7 @@ func Retry(attempts int, sleep time.Duration, function func() (interface{}, erro
 	for attempt := 0; attempt < attempts; attempt++ {
 		if attempt > 0 {
 			log.Printf("Retrying after %v", err)
-			time.Sleep(sleep)
+			time.Sleep(sleep * time.Duration(attempt))
 		}
 
 		var result interface{}

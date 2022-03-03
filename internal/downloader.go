@@ -6,38 +6,41 @@ import (
     "strings"
     "os"
     "fmt"
+    "time"
 
 	"github.com/emersion/go-imap/client"
 	"github.com/emersion/go-imap"
 )
 
-const retries = 3
+const retries = 5
 const pageSize uint32 = 100
+const limitDuration time.Duration = 100 * time.Millisecond
 
 type Downloader struct {
 	configuration *Configuration
 	storage Storage
     debug bool
+    client *client.Client
+    limiter <-chan time.Time
 }
 
 func NewDownloader(configuration *Configuration) *Downloader {
-    return &Downloader{configuration: configuration, storage: NewFileStorage(configuration.StoragePath), debug: false}
+    return &Downloader{
+        configuration: configuration,
+        storage: NewFileStorage(configuration.StoragePath),
+        limiter: time.Tick(limitDuration),
+        debug: false,
+        client: nil,
+    }
 }
 
 func (d *Downloader) Download() error {
-    i, err := Retry(retries, d.configuration.TimeoutDuration, func() (interface{}, error) {
-        return d.createClient(d.debug)
-    })
-    if err != nil {
-		return err
-	}
-    c := i.(*client.Client)
-    if c != nil {
-        defer c.Logout()
+    if err := d.assignClient(); err != nil {
+        return err
     }
 
-    i, err = Retry(retries, d.configuration.TimeoutDuration, func() (interface{}, error) {
-        return d.getMailboxes(c)
+    i, err := d.retryWithConnection(func() (interface{}, error) {
+        return d.getMailboxes()
     })
     if err != nil {
         return err
@@ -58,8 +61,8 @@ func (d *Downloader) Download() error {
         }
 
         log.Printf("Downloading mailbox %s", mailbox.Name)
-        _, err := Retry(retries, d.configuration.TimeoutDuration, func() (interface{}, error) {
-            err := d.downloadMailbox(c, mailbox)
+        _, err := d.retryWithConnection(func() (interface{}, error) {
+            err := d.downloadMailbox(mailbox)
             return nil, err
         })
         if err != nil {
@@ -67,16 +70,27 @@ func (d *Downloader) Download() error {
         }
 	}
 
+    if d.client != nil {
+        d.client.Logout()
+        d.client = nil
+    }
+    
 	return nil
 }
 
-func (d *Downloader) createClient(debug bool) (*client.Client, error) {
+func (d *Downloader) assignClient() error {
+    var err error
+    d.client, err = d.createClient()
+    return err
+}
+
+func (d *Downloader) createClient() (*client.Client, error) {
     // TODO: Support non-TLS
     c, err := client.DialTLS(d.configuration.Address, nil)
     if err != nil {
 		return nil, err
 	}
-    if debug {
+    if d.debug {
         c.SetDebug(os.Stdout)
     }
 
@@ -95,11 +109,42 @@ func (d *Downloader) createClient(debug bool) (*client.Client, error) {
     return c, nil
 }
 
-func (d *Downloader) getMailboxes(c *client.Client) ([]*imap.MailboxInfo, error) {
+func (d *Downloader) useClient() (*client.Client, error) {
+    if d.client == nil {
+        if err := d.assignClient(); err != nil {
+            return nil, err
+        }
+    }
+    
+    <-d.limiter
+    return d.client, nil
+}
+
+func (d *Downloader) retryWithConnection(function func() (interface{}, error)) (interface{}, error) {
+    return Retry(retries, d.configuration.TimeoutDuration, func() (interface{}, error) {
+        result, err := function()
+
+        // If there was an error, reset the connection
+        if err != nil && d.client != nil {
+            // Log out and ignore errors
+            d.client.Logout()
+            d.client = nil
+        }
+
+        return result, err
+    })
+}
+
+func (d *Downloader) getMailboxes() ([]*imap.MailboxInfo, error) {
 	mailboxes := make(chan *imap.MailboxInfo)
 	done := make(chan error, 1)
 	go func () {
-        done <- c.List("", "%", mailboxes)
+        client, err := d.useClient()
+        if err != nil {
+            done <- err
+        } else {
+            done <- client.List("", "%", mailboxes)
+        }
 	}()
 
     mailboxesInfo := make([]*imap.MailboxInfo, 0)
@@ -113,8 +158,12 @@ func (d *Downloader) getMailboxes(c *client.Client) ([]*imap.MailboxInfo, error)
     return mailboxesInfo, nil
 }
 
-func (d *Downloader) downloadMailbox(c *client.Client, info *imap.MailboxInfo) error {
-    mailbox, err := c.Select(info.Name, true)
+func (d *Downloader) downloadMailbox(info *imap.MailboxInfo) error {
+    client, err := d.useClient()
+    if err != nil {
+        return err
+    }
+    mailbox, err := client.Select(info.Name, true)
     if err != nil {
         return err
     }
@@ -130,8 +179,16 @@ func (d *Downloader) downloadMailbox(c *client.Client, info *imap.MailboxInfo) e
             to = mailbox.Messages
         }
 
-        _, err := Retry(retries, d.configuration.TimeoutDuration, func() (interface{}, error) {
-            err := d.downloadRange(c, from, to)
+        _, err := d.retryWithConnection(func() (interface{}, error) {
+            client, err := d.useClient()
+            if err != nil {
+                return nil, err
+            }
+            if _, err := client.Select(info.Name, true); err != nil {
+                return nil, err
+            }
+
+            err = d.downloadRange(from, to)
             return nil, err
         })
         if err != nil {
@@ -144,7 +201,7 @@ func (d *Downloader) downloadMailbox(c *client.Client, info *imap.MailboxInfo) e
     return nil
 }
 
-func (d *Downloader) downloadRange(c *client.Client, from uint32, to uint32) error {
+func (d *Downloader) downloadRange(from uint32, to uint32) error {
     log.Printf("Downloading message sequence from %d to %d", from, to)
 
     seqset := new(imap.SeqSet)
@@ -153,16 +210,27 @@ func (d *Downloader) downloadRange(c *client.Client, from uint32, to uint32) err
 	messages := make(chan *imap.Message, pageSize)
 	done := make(chan error, 1)
 	go func() {
-		done <- c.Fetch(seqset, []imap.FetchItem{imap.FetchRFC822, imap.FetchEnvelope}, messages)
+        client, err := d.useClient()
+        if err != nil {
+            done <- err
+        } else {
+		    done <- client.Fetch(seqset, []imap.FetchItem{imap.FetchRFC822}, messages)
+        }
 	}()
 	
 	for message := range messages {
         message, err := NewMessageFromIMAP(message)
         if err != nil {
-            return err
+            log.Printf("Skipping malformed message %v", message)
+            continue
         }
+
 		if err := d.storage.Save(message); err != nil {
-			return err
+		    if IsMalformedMessageError(err) {
+                log.Printf("Skipping malformed message %v", message)
+                continue
+            }
+            return err
 		}
 	}
 	if err := <-done; err != nil {

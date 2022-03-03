@@ -41,3 +41,10 @@ func NewMessage(inbound io.Reader) (*Message, error) {
 	
 	return newMessageFromBuffer(buffer)
 }
+
+func IsMalformedMessageError(err error) bool {
+	if err == mail.ErrHeaderNotPresent {
+		return true
+	}
+	return false
+}
