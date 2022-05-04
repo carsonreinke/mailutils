@@ -1,14 +1,14 @@
 package internal
 
 import (
-	"regexp"
+	"bytes"
 	"fmt"
-	"bufio"
+	"regexp"
 )
 
 type Searcher struct {
 	configuration *Configuration
-	storage Storage
+	storage       Storage
 }
 
 func NewSearcher(configuration *Configuration) *Searcher {
@@ -24,7 +24,6 @@ func (d *Searcher) Search(keywords []string) error {
 		}
 		regexps[index] = regexp
 	}
-	
 
 	messages := make(chan *Message, 10)
 	done := make(chan error, 1)
@@ -33,7 +32,7 @@ func (d *Searcher) Search(keywords []string) error {
 		done <- d.storage.Search(func(message *Message) bool {
 			match := true
 			for _, regexp := range regexps {
-				match = match && regexp.MatchReader(bufio.NewReader(message.Body))
+				match = match && regexp.MatchReader(bytes.NewReader(message.Raw))
 			}
 			return match
 		}, messages)
@@ -42,9 +41,6 @@ func (d *Searcher) Search(keywords []string) error {
 	for message := range messages {
 		fmt.Println(message.Header.Get("Message-Id"))
 	}
-	if err := <-done; err != nil {
-		return err
-	}
 
-	return nil
+	return <-done
 }

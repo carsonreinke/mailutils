@@ -1,20 +1,22 @@
 package internal
 
 import (
-	"path/filepath"
-	"os"
+	"bytes"
+	"errors"
+	"fmt"
 	"io"
 	"log"
-	"errors"
+	"os"
+	"path/filepath"
 	"strings"
-	"bytes"
+	"sync"
 )
 
 type FileStorage struct {
 	BasePath string
 }
 
-func NewFileStorage(basePath string) (*FileStorage) {
+func NewFileStorage(basePath string) *FileStorage {
 	if basePath == "" {
 		return nil
 	}
@@ -24,6 +26,12 @@ func NewFileStorage(basePath string) (*FileStorage) {
 
 func hasMessageId(message *Message) bool {
 	return message.Header != nil && strings.TrimSpace(message.Header.Get("Message-Id")) != ""
+}
+
+func messageFileBaseName(messageId string) string {
+	messageId = strings.ReplaceAll(messageId, "<", "")
+	messageId = strings.ReplaceAll(messageId, ">", "")
+	return messageId + ".eml"
 }
 
 func (s *FileStorage) messageFilePath(message *Message) (string, error) {
@@ -36,11 +44,9 @@ func (s *FileStorage) messageFilePath(message *Message) (string, error) {
 		return "", err
 	}
 
-	partition := filepath.Join(messageDate.Format("2006"), messageDate.Format("01")) 
+	partition := filepath.Join(messageDate.Format("2006"), messageDate.Format("01"))
 	messageId := message.Header.Get("Message-Id")
-	messageId = strings.ReplaceAll(messageId, "<", "")
-	messageId = strings.ReplaceAll(messageId, ">", "")
-	return filepath.Join(s.BasePath, partition, messageId + ".eml"), nil
+	return filepath.Join(s.BasePath, partition, messageFileBaseName(messageId)), nil
 }
 
 func (s *FileStorage) load(filePath string) (*Message, error) {
@@ -53,7 +59,7 @@ func (s *FileStorage) load(filePath string) (*Message, error) {
 	return message, err
 }
 
-func (s *FileStorage) traverse(name string, current_depth int, ch chan<- *Message) error {
+func (s *FileStorage) find(name string, current_depth int, ch chan<- string, stop <-chan struct{}) error {
 	entries, err := os.ReadDir(name)
 	if err != nil {
 		close(ch)
@@ -61,19 +67,20 @@ func (s *FileStorage) traverse(name string, current_depth int, ch chan<- *Messag
 	}
 
 	for _, entry := range entries {
+		select {
+		case <-stop:
+			return nil
+		default:
+		}
+
 		filePath := filepath.Join(name, entry.Name())
 		if entry.IsDir() {
-			if err := s.traverse(filePath, current_depth+1, ch); err != nil {
+			if err := s.find(filePath, current_depth+1, ch, stop); err != nil {
 				close(ch)
 				return err
 			}
 		} else {
-			message, err := s.load(filePath)
-			if err != nil {
-				close(ch)
-				return err
-			}
-			ch <- message
+			ch <- filePath
 		}
 	}
 
@@ -81,6 +88,51 @@ func (s *FileStorage) traverse(name string, current_depth int, ch chan<- *Messag
 		close(ch)
 	}
 	return nil
+}
+
+func (s *FileStorage) traverse(name string, ch chan<- *Message, stop <-chan struct{}) error {
+	defer close(ch)
+
+	var wg sync.WaitGroup
+	concurrency := 5
+	files_ch := make(chan string, concurrency)
+	files_stop := make(chan struct{})
+	done := make(chan error, 1)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		done <- s.find(name, 0, files_ch, files_stop)
+	}()
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			for filePath := range files_ch {
+				select {
+				case <-stop:
+					return
+				case <-files_stop:
+					return
+				default:
+				}
+
+				message, err := s.load(filePath)
+				if err != nil {
+					close(files_stop)
+					done <- err
+					return
+				}
+				ch <- message
+			}
+		}()
+	}
+
+	wg.Wait()
+	return <-done
 }
 
 func (s *FileStorage) Save(message *Message) error {
@@ -97,7 +149,7 @@ func (s *FileStorage) Save(message *Message) error {
 	if err != nil {
 		return err
 	}
-	
+
 	log.Printf("Saving message %s", message.Header.Get("Message-Id"))
 
 	err = os.MkdirAll(filepath.Dir(filePath), 0700)
@@ -117,48 +169,63 @@ func (s *FileStorage) Save(message *Message) error {
 	return nil
 }
 
-func (s *FileStorage) Search(filter func(*Message) (bool), ch chan<- *Message) error {
-	filter_ch := make(chan *Message)
+func (s *FileStorage) Search(filter func(*Message) bool, ch chan<- *Message) error {
+	defer close(ch)
+
+	filter_ch := make(chan *Message, 5)
+	done := make(chan error, 1)
+
 	go func() {
-		for message := range filter_ch {
-			if filter(message) {
-				ch <- message
-			}
-		}
-		close(ch)
+		done <- s.traverse(s.BasePath, filter_ch, make(chan struct{}))
 	}()
-	
-	err := s.traverse(s.BasePath, 0, filter_ch)
-	if err != nil {
-		close(filter_ch)
-		close(ch)
+
+	for message := range filter_ch {
+		if filter(message) {
+			ch <- message
+		}
 	}
-	return err
+
+	return <-done
 }
 
-func (s *FileStorage) Load(mailId string) (*Message, error) {
+func (s *FileStorage) Load(messageId string) (*Message, error) {
 	ch := make(chan *Message)
+	stop := make(chan struct{})
 	done := make(chan error)
-	go func() {
-		err := s.traverse(s.BasePath, 0, ch)
 
-		if err != nil {
-			done <- err
-		}
+	go func() {
+		done <- s.traverse(s.BasePath, ch, stop)
 	}()
-	
+
 	for message := range ch {
-		if(message.Header.Get("Message-Id") == mailId) {
-			//close(ch)
+		if message.Header.Get("Message-Id") == messageId {
+			close(stop)
 			return message, nil
 		}
 	}
-	if err := <-done; err != nil {
-		return nil, err
-	}
-	return nil, nil
+
+	return nil, <-done
 }
 
-// func (s *FileStorage) Exists(mailId string) (*bool, error) {
+func (s *FileStorage) Remove(messageId string) error {
+	ch := make(chan string)
+	stop := make(chan struct{})
+	done := make(chan error)
 
-// }
+	go func() {
+		done <- s.find(s.BasePath, 0, ch, stop)
+	}()
+
+	for filePath := range ch {
+		//if filepath.Base(filePath) == messageFileBaseName(messageId) {
+		if strings.HasSuffix(filePath, messageFileBaseName(messageId)) {
+			err := os.Remove(filePath)
+			return err
+		}
+	}
+
+	if err := <-done; err != nil {
+		return err
+	}
+	return fmt.Errorf("Message not found: %v", messageId)
+}
